@@ -1,7 +1,6 @@
 # speaker
 
-Tongdun speaker verification  competition
-'nlpr_fight' team work 
+Tongdun speaker verification  competition : 'nlpr_fight' team work 
 
 usage:
 sh run.sh --stage 0 --seq_training true --train_type base_attention
