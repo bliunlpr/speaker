@@ -128,7 +128,6 @@ class DeepSpeakerModel(ModelBase):
         self._bidirectional = opt.bidirectional
         self._dropout = opt.dropout
         self.train_type = opt.train_type
-        self._class_spk_num = opt.num_classes
         self.w = nn.Parameter(torch.FloatTensor(np.array([10])))
         self.b = nn.Parameter(torch.FloatTensor(np.array([-5])))
         rnn_input_size = opt.num_features * (opt.delta_order + 1) * (opt.left_context_width + opt.right_context_width + 1)
@@ -190,10 +189,7 @@ class DeepSpeakerModel(ModelBase):
             x = torch.bmm(x_a.transpose(0, 1).transpose(1, 2), attn) 
             x = x.view(x.size(0), -1)      
         x = normalize(x)
-        if attn is not None:
-            return x, attn
-        else:
-            return x
+        return x, attn        
             
             
 class DeepSpeakerSeqModel(ModelBase):
@@ -207,6 +203,7 @@ class DeepSpeakerSeqModel(ModelBase):
         self._bidirectional = opt.bidirectional
         self._dropout = opt.dropout
         self.train_type = opt.train_type
+        self.segment_type = opt.segment_type
         self.w = nn.Parameter(torch.FloatTensor(np.array([10])))
         self.b = nn.Parameter(torch.FloatTensor(np.array([-5])))
         rnn_input_size = opt.num_features * (opt.delta_order + 1) * (opt.left_context_width + opt.right_context_width + 1)
@@ -246,13 +243,22 @@ class DeepSpeakerSeqModel(ModelBase):
         out = None
         attn_i = None
         attn = None
+        out_segment = None
         start = 0
         for i in range(segment_num.size(0)):
             end = start + int(segment_num[i])
             out_i = x[-1, start:end, :].squeeze(0)
-            if len(out_i.shape) == 1:
-                out_i = out_i.unsqueeze(0)   
             start += int(segment_num[i])    
+            if len(out_i.shape) == 1:
+                out_i = out_i.unsqueeze(0) 
+                 
+            if self.segment_type == 'average':
+                out_segment_i = torch.mean(out_i, dim=0, keepdim=True)
+            elif self.segment_type == 'all':
+                out_segment_i = out_i
+            else:
+                out_segment_i = None 
+                            
             if self.train_type == 'last_state':
                 out_i = out_i[-1, :]
                 out_i = self.fc(out_i)
@@ -290,16 +296,300 @@ class DeepSpeakerSeqModel(ModelBase):
                     attn = attn_i
                 else:
                     attn = torch.cat((attn, attn_i), 0) 
+                    
+            if out_segment_i is not None:
+                if out_segment is None:
+                    out_segment = out_segment_i
+                else:
+                    out_segment = torch.cat((out_segment, out_segment_i), 0)
                                                    
         out = normalize(out)
-        if attn is not None:
-            return out, attn
-        else:
-            return out
+        if out_segment is not None:
+            out_segment = normalize(out_segment)        
+        return out, attn, out_segment
         
         
+class ReLU(nn.Hardtanh):
+
+    def __init__(self, inplace=False):
+        super(ReLU, self).__init__(0, 20, inplace)
+
+    def __repr__(self):
+        inplace_str = 'inplace' if self.inplace else ''
+        return self.__class__.__name__ + ' (' \
+            + inplace_str + ')'
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.PReLU()
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+        out = self.bn1(x)
+        out = self.relu(out)
+        out = self.conv1(out)
+                
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        out += residual        
+        return out
+
+
+class myResNet(nn.Module):
+
+    def __init__(self, block, layers, num_classes=1000):
+
+        super(myResNet, self).__init__()
+        self.relu = ReLU(inplace=True)
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+
+        self.inplanes = 128
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.layer2 = self._make_layer(block, 128, layers[1])
+        
+        self.inplanes = 256
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(256)
+        self.layer3 = self._make_layer(block, 256, layers[2])
+        
+        self.inplanes = 512
+        self.conv4 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1,bias=False)
+        self.bn4 = nn.BatchNorm2d(512)
+        self.layer4 = self._make_layer(block, 512, layers[3])
+
+        self.avgpool = nn.AdaptiveAvgPool2d([4,1])
+        self.fc = nn.Linear(512 * 4, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        layers = []
+        layers.append(block(self.inplanes, planes, stride))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+
+class DeepSpeakerCnnModel(ModelBase):
+
+    def __init__(self, opt):
+
+        super(DeepSpeakerCnnModel, self).__init__()        
+        self.embedding_size = opt.embedding_size
+        self.model = myResNet(BasicBlock, [2, 2, 2, 2], self.embedding_size)
+        self.w = nn.Parameter(torch.FloatTensor(np.array([10])))
+        self.b = nn.Parameter(torch.FloatTensor(np.array([-5])))
+        
+    def l2_norm(self,input):
+        input_size = input.size()
+        buffer = torch.pow(input, 2)
+        normp = torch.sum(buffer, 1).add_(1e-10)
+        norm = torch.sqrt(normp)
+        _output = torch.div(input, norm.view(-1, 1).expand_as(input))
+        output = _output.view(input_size)
+        return output
+
+    def forward(self, x):
+        x = self.model.conv1(x)
+        x = self.model.bn1(x)
+        x = self.model.relu(x)
+        x = self.model.layer1(x)
+
+        x = self.model.conv2(x)
+        x = self.model.bn2(x)
+        x = self.model.relu(x)
+        x = self.model.layer2(x)
+
+        x = self.model.conv3(x)
+        x = self.model.bn3(x)
+        x = self.model.relu(x)
+        x = self.model.layer3(x)
+
+        x = self.model.conv4(x)
+        x = self.model.bn4(x)
+        x = self.model.relu(x)
+        x = self.model.layer4(x)
+
+        x = self.model.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.model.fc(x)
+        self.features = normalize(x)
+
+        return self.features
+
+        
+class DeepSpeakerCnnSeqModel(ModelBase):
+
+    def __init__(self, opt):
+
+        super(DeepSpeakerCnnSeqModel, self).__init__()        
+        self.embedding_size = opt.embedding_size
+        self.train_type = opt.train_type
+        self.segment_type = opt.segment_type
+        self.model = myResNet(BasicBlock, [2, 2, 2, 2], self.embedding_size)
+        self.w = nn.Parameter(torch.FloatTensor(np.array([10])))
+        self.b = nn.Parameter(torch.FloatTensor(np.array([-5])))
+        
+        if self.train_type == 'base_attention':
+            self.query = nn.Sequential(nn.Linear(self.embedding_size, 1))
+
+        if self.train_type == 'multi_attention' or self.train_type == 'divide_attention':
+            self.attention_dim = opt.attention_dim
+            self.attention_head_num = opt.attention_head_num
+            self.w1 = nn.Sequential(nn.Linear(self.embedding_size, self.attention_dim, bias=False),
+                                    nn.ReLU(),
+                                    nn.Linear(self.attention_dim, self.attention_head_num, bias=False))
+            
+
+    def l2_norm(self,input):
+        input_size = input.size()
+        buffer = torch.pow(input, 2)
+        normp = torch.sum(buffer, 1).add_(1e-10)
+        norm = torch.sqrt(normp)
+        _output = torch.div(input, norm.view(-1, 1).expand_as(input))
+        output = _output.view(input_size)
+        return output
+    
+    def forward(self, x, segment_num):
+        x = self.model.conv1(x)
+        x = self.model.bn1(x)
+        x = self.model.relu(x)
+        x = self.model.layer1(x)
+
+        x = self.model.conv2(x)
+        x = self.model.bn2(x)
+        x = self.model.relu(x)
+        x = self.model.layer2(x)
+
+        x = self.model.conv3(x)
+        x = self.model.bn3(x)
+        x = self.model.relu(x)
+        x = self.model.layer3(x)
+
+        x = self.model.conv4(x)
+        x = self.model.bn4(x)
+        x = self.model.relu(x)
+        x = self.model.layer4(x)
+
+        x = self.model.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.model.fc(x)
+        
+        assert x.size(0) == torch.sum(segment_num), print(x.size(), segment_num)
+        out = None
+        out_segment = None
+        attn_i = None
+        attn = None
+        start = 0
+        for i in range(segment_num.size(0)):
+            end = start + int(segment_num[i])
+            out_i = x[start:end, :]
+            start += int(segment_num[i])
+            if len(out_i.shape) == 1:
+                out_i = out_i.unsqueeze(0)
+
+            if self.segment_type == 'average':
+                out_segment_i = torch.mean(out_i, dim=0, keepdim=True)
+            elif self.segment_type == 'all':
+                out_segment_i = out_i
+            else:
+                out_segment_i = None
+
+            if self.train_type == 'average_state':
+                out_i = torch.mean(out_i, dim=0)
+            elif self.train_type == 'base_attention':
+                query = self.query(out_i).squeeze(1)
+                query = F.softmax(query, 0)
+                out_i = out_i.transpose(0, 1)
+                out_i = torch.mv(out_i, query)
+            elif self.train_type == 'multi_attention':
+                attn_i = self.w1(out_i)
+                attn_i = F.softmax(attn_i, 0)
+                out_i = torch.mm(out_i.transpose(0, 1), attn_i) 
+                out_i = out_i.view(-1)     
+            elif self.train_type == 'divide_attention':
+                x_a = out_i[:, :self._hidden_size]
+                x_b = out_i[:, self._hidden_size:]
+                attn_i = self.w1(x_b)
+                attn_i = F.softmax(attn_i, 0)
+                out_i = torch.mm(x_a.transpose(0, 1), attn_i)
+                out_i = out_i.view(out_i.size(0), -1)
+
+            out_i = out_i.unsqueeze(0)
+            if out is None:
+                out = out_i
+            else:
+                out = torch.cat((out, out_i), 0)
+
+            if out_segment_i is not None:
+                if out_segment is None:
+                    out_segment = out_segment_i
+                else:
+                    out_segment = torch.cat((out_segment, out_segment_i), 0)
+
+            if attn_i is not None:
+                attn_i = torch.mm(attn_i.transpose(0, 1), attn_i).unsqueeze(0)
+                if attn is None:
+                    attn = attn_i
+                else:
+                    attn = torch.cat((attn, attn_i), 0)
+
+        out = normalize(out)
+        if out_segment is not None:
+            out_segment = normalize(out_segment)
+            
+        return out, attn, out_segment
+          
+                                
 def normalize(x):
-    """ normalize the last dimension vector of the input matrix
+    """ normalize the last dimension vector of the input matrix .unsqueeze(0)
     :return: normalized input
     """
     return x / torch.sqrt(torch.sum(x**2, dim=-1, keepdim=True) + 1e-6)     
@@ -310,7 +600,7 @@ def similarity(embedded, w, b, opt, center=None):
     :return: tf similarity matrix (NM x N)
     """
     N = opt.speaker_num
-    M = opt.utter_num * opt.segment_num
+    M = opt.utter_num 
     ##S = opt.segment_num
     if opt.train_type == 'multi_attention' or opt.train_type == 'divide_attention':
         P = opt.embedding_size * opt.attention_head_num   
@@ -344,7 +634,7 @@ def loss_cal(S, opt):
     :return: loss
     """
     N = opt.speaker_num
-    M = opt.utter_num * opt.segment_num
+    M = opt.utter_num 
     loss_type = opt.loss_type
     S_correct = torch.cat([S[i*M:(i+1)*M, i:(i+1)] for i in range(N)], dim=0)  # colored entries in Fig.1
 
@@ -442,6 +732,8 @@ def penalty_loss_cal(A, device):
     return loss_call(out, I.expand_as(out))
     
 def penalty_seq_loss_cal(A, device):
+    print(A.shape)
     loss_call = torch.nn.MSELoss(size_average=False)
-    I = torch.eye(A.size(2)).to(device)
+    I = torch.eye(A.size(1)).to(device)
+    print(I.expand_as(A).shape)
     return loss_call(A, I.expand_as(A))

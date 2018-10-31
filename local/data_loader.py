@@ -80,13 +80,11 @@ class BaseDataset(Dataset):
         self.normalize_type = opt.normalize_type 
         self.speaker_num = opt.speaker_num
         self.utter_num = opt.utter_num
-        self.segment_num = opt.segment_num
         self.cmvn = None
         self.data_type = opt.data_type
         self.lb = opt.lb
         self.ub = opt.ub
         
-        self.feat_type = opt.feat_type
         self.delta_order         = opt.delta_order
         self.left_context_width  = opt.left_context_width
         self.right_context_width = opt.right_context_width
@@ -251,20 +249,18 @@ class DeepSpeakerDataset(BaseDataset):
             for x in rand_idx:
                 selected_file = self.indices[x]                  
                 utter_num = self.utter_num    
-                feature_mats = np.zeros(shape=[utter_num * self.segment_num, frame_slice, self.nfeatures], dtype=np.float32)
-                spk_id_mats = np.zeros(shape=[utter_num * self.segment_num, frame_slice], dtype=np.int64)                
+                feature_mats = np.zeros(shape=[utter_num, frame_slice, self.nfeatures], dtype=np.float32)
+                spk_id_mats = np.zeros(shape=[utter_num, frame_slice], dtype=np.int64)                
                 for num in range(utter_num):
                     feature_mat_slice = None
                     while feature_mat_slice is None:
                         index = random.randint(0, len(selected_file) - 1)
                         utt_id, audio_path = selected_file[index] 
                         feature_mat = self.parse_audio(audio_path)                                       
-                        feature_mat_slice = self.load_norm(feature_mat, frame_slice)                        
-                    for i in range(self.segment_num): 
-                        feature_mat_slice = self.load_norm(feature_mat, frame_slice)                       
-                        feature_mats[num * self.segment_num + i, :, :] = feature_mat_slice   # each speakers utterance [M, frames, n_mels]
-                        spk_id_mats[num * self.segment_num + i, :] = np.array([self.utt2spk_ids[utt_id]] * frame_slice, dtype=np.int64)                        
-                                                  
+                        feature_mat_slice = self.load_norm(feature_mat, frame_slice) 
+                        feature_mats[num, :, :] = feature_mat_slice   # each speakers utterance [M, frames, n_mels]
+                        spk_id_mats[num, :] = np.array([self.utt2spk_ids[utt_id]] * frame_slice, dtype=np.int64)                           
+                       
                 utter_batch.append(feature_mats)
                 utter_spk_ids_batch.append(spk_id_mats)
                 del feature_mats
@@ -319,13 +315,14 @@ class DeepSpeakerSeqDataset(BaseDataset):
                 feature_mats = np.zeros(shape=[0, frame_slice, self.nfeatures], dtype=np.float32)
                 spk_id_mats = np.zeros(shape=[0, frame_slice], dtype=np.int64)
                 for num in range(utter_num):
-                    feature_mat = None
-                    while feature_mat is None:
+                    feature_mat_slice = None
+                    while feature_mat_slice is None:
                         index = random.randint(0, len(selected_file) - 1)
                         utt_id, audio_path = selected_file[index] 
                         feature_mat = self.parse_audio(audio_path)
-                        feature_mat = self.load_norm(feature_mat, frame_slice=None)             
-                    segment_num = 0   
+                        feature_mat_slice = self.load_norm(feature_mat, frame_slice=self.frame_slice_steps)             
+                    segment_num = 0  
+                    feature_mat = self.load_norm(feature_mat, frame_slice=None)   
                     for start in range(0, feature_mat.shape[0], self.frame_slice_steps):
                         end = start + frame_slice
                         if end < feature_mat.shape[0] and segment_num < 25: 

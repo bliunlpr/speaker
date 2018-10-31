@@ -12,7 +12,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from model import DeepSpeakerModel, DeepSpeakerSeqModel, similarity, loss_cal, normalize, penalty_loss_cal, similarity_segment, loss_cal_segment, penalty_seq_loss_cal
+from model import DeepSpeakerModel, DeepSpeakerSeqModel, DeepSpeakerCnnModel, DeepSpeakerCnnSeqModel
+from model import similarity, loss_cal, normalize, penalty_loss_cal, similarity_segment, loss_cal_segment, penalty_seq_loss_cal
 from config import TrainOptions
 from data_loader import DeepSpeakerDataset, DeepSpeakerDataLoader, DeepSpeakerSeqDataset, DeepSpeakerSeqDataLoader
 import utils 
@@ -54,44 +55,64 @@ def train(opt, model, optimizer):
     total_steps = opt.total_steps
     losses = utils.AverageMeter()
     embedding_losses = utils.AverageMeter()
+    embedding_segment_losses = utils.AverageMeter()
     penalty_losses = utils.AverageMeter()
     lr = opt.lr
         
     for i, (data) in enumerate(train_loader, start=0): 
         if opt.seq_training == 'true':
             feature_input, seq_len, spk_ids = data
-            feature_input = feature_input.squeeze(0).to(device)
             seq_len = seq_len.squeeze(0).to(device)
-            spk_ids = spk_ids.squeeze(0).to(device)
-            if opt.train_type == 'multi_attention':
-                outputs, attention_matrix = model(feature_input, seq_len)
-                sim_matrix = similarity(outputs, model.w, model.b, opt)
-                embedding_loss = opt.embedding_loss_lamda * loss_cal(sim_matrix, opt)
-                penalty_loss = opt.penalty_loss_lamda * penalty_seq_loss_cal(attention_matrix, device)
-                loss = embedding_loss + penalty_loss
+            if opt.model_type == 'lstm':  
+                feature_input = feature_input.squeeze(0).to(device)
+            elif opt.model_type == 'cnn': 
+                feature_input = feature_input.transpose(1, 2).transpose(0, 1).to(device)                
+            else:
+                raise Exception('wrong model_type {}'.format(opt.model_type))  
+                     
+            outputs, attention_matrix, segment_outputs = model(feature_input, seq_len)
+            sim_matrix = similarity(outputs, model.w, model.b, opt)
+            embedding_loss = opt.embedding_loss_lamda * loss_cal(sim_matrix, opt)
+                
+            if opt.segment_type == 'average':
+                sim_matrix = similarity(segment_outputs, model.w, model.b, opt)
+                embedding_loss_segment = opt.segment_loss_lamda * loss_cal(sim_matrix, opt)
+                embedding_segment_losses.update(embedding_loss_segment.item())
+            elif opt.segment_type == 'all':
+                sim_matrix = similarity_segment(segment_outputs, seq_len, model.w, model.b, opt)
+                embedding_loss_segment = opt.segment_loss_lamda * loss_cal_segment(sim_matrix, seq_len, opt)
+                embedding_segment_losses.update(embedding_loss_segment.item())
+            else:
+                embedding_loss_segment = 0
+                            
+            if opt.train_type == 'multi_attention':                    
+                penalty_loss = opt.penalty_loss_lamda * penalty_seq_loss_cal(attention_matrix, device)                
                 penalty_losses.update(penalty_loss.item())
             else:
-                outputs = model(feature_input, seq_len)
-                sim_matrix = similarity(outputs, model.w, model.b, opt)
-                embedding_loss = opt.embedding_loss_lamda * loss_cal(sim_matrix, opt)
-                loss = embedding_loss 
+                penalty_loss = 0                 
+            loss = embedding_loss + penalty_loss + embedding_loss_segment             
         else:
-            feature_input, spk_ids = data   
-            spk_ids = spk_ids.squeeze(0).to(device)
-            feature_input = feature_input.squeeze(0).to(device)
-
-            if opt.train_type == 'multi_attention':
+            feature_input, spk_ids = data 
+            if opt.model_type == 'lstm':  
+                feature_input = feature_input.squeeze(0).to(device)
                 outputs, attention_matrix = model(feature_input)
                 sim_matrix  = similarity(outputs, model.w, model.b, opt)
                 embedding_loss = opt.embedding_loss_lamda * loss_cal(sim_matrix, opt)
-                penalty_loss = opt.penalty_loss_lamda * penalty_seq_loss_cal(attention_matrix, device)
+                if opt.train_type == 'multi_attention':                
+                    penalty_loss = opt.penalty_loss_lamda * penalty_loss_cal(attention_matrix, device)                    
+                    penalty_losses.update(penalty_loss.item())
+                else:
+                    penalty_loss = 0 
                 loss = embedding_loss + penalty_loss
-                penalty_losses.update(penalty_loss.item())
-            else:
+            elif opt.model_type == 'cnn': 
+                feature_input = feature_input.transpose(1, 2).transpose(0, 1).to(device)
                 outputs = model(feature_input)
-                sim_matrix = similarity(outputs, model.w, model.b, opt)
+                sim_matrix  = similarity(outputs, model.w, model.b, opt)
                 embedding_loss = opt.embedding_loss_lamda * loss_cal(sim_matrix, opt)
-                loss = embedding_loss 
+                loss = embedding_loss
+            else:
+                raise Exception('wrong model_type {}'.format(opt.model_type))
+                  
         # Backward
         optimizer.zero_grad()
         loss.backward()
@@ -101,16 +122,13 @@ def train(opt, model, optimizer):
             continue
         optimizer.step()
         
+        
         losses.update(loss.item())
         embedding_losses.update(embedding_loss.item())
-              
-                     
+                                   
         if total_steps % opt.print_freq == 0:
-            logging.info('  ==> Train set steps {} lr: {:.6f}, loss: {:.4f} [ embedding: {:.4f}, penalty_loss {:.4f}]'
-                         .format(total_steps, lr, losses.avg, embedding_losses.avg, penalty_losses.avg))     
-            losses.reset()
-            embedding_losses.reset()
-            penalty_losses.reset()
+            logging.info('==> Train set steps {} lr: {:.6f}, loss: {:.4f} [ embedding: {:.4f}, embedding_segment: {:.4f}, penalty_loss {:.4f}]'
+                             .format(total_steps, lr, losses.avg, embedding_losses.avg, embedding_segment_losses.avg, penalty_losses.avg)) 
             state = {'state_dict': model.state_dict(), 'opt': opt,                                             
                      'learning_rate': lr, 'total_steps': total_steps}
             filename = 'latest'
@@ -124,8 +142,11 @@ def train(opt, model, optimizer):
             filename='steps-{}_lr-{:.6f}_EER-{:.4f}.pth'.format(total_steps, lr, EER)
             utils.save_checkpoint(state, opt.expr_dir, filename=filename)
             model.train() 
-        total_steps += 1        
-        
+            losses.reset()
+            embedding_losses.reset()
+            embedding_segment_losses.reset()
+            penalty_losses.reset()
+        total_steps += 1                
         if total_steps > opt.training_total_steps:
             logging.info('finish training, total_steps is  {}'.format(total_steps))
             break          
@@ -166,17 +187,7 @@ def evaluate(opt, model):
                     input_a = torch.cat((input_a, feature_mat), 1)
             input_a = input_a.to(device)
             seq_a = torch.LongTensor([seq_a]).to(device)
-            if opt.seq_training == 'true':
-                if opt.train_type == 'multi_attention':
-                    out_a, _ = model(input_a, seq_a)
-                else:
-                    out_a = model(input_a, seq_a)
-            else:
-                if opt.train_type == 'multi_attention':
-                    out_a, _ = model(input_a)
-                else:
-                    out_a = model(input_a)
-
+            
             input_b = None
             seq_b = 0
             length = data_b.size(0)
@@ -196,16 +207,22 @@ def evaluate(opt, model):
                     input_b = torch.cat((input_b, feature_mat), 1)
             input_b = input_b.to(device)
             seq_b = torch.LongTensor([seq_b]).to(device)
+            
             if opt.seq_training == 'true':
-                if opt.train_type == 'multi_attention':
-                    out_b, _ = model(input_b, seq_b)
-                else:
-                    out_b = model(input_b, seq_b)
+                if opt.model_type == 'cnn': 
+                    input_a = input_a.transpose(0, 1).unsqueeze(1).to(device)
+                    input_b = input_b.transpose(0, 1).unsqueeze(1).to(device)
+                out_a, _, _ = model(input_a, seq_a)
+                out_b, _, _ = model(input_b, seq_b)
             else:
-                if opt.train_type == 'multi_attention':
+                if opt.model_type == 'lstm':  
+                    out_a, _ = model(input_a)
                     out_b, _ = model(input_b)
-                else:
-                    out_b = model(input_b)
+                elif opt.model_type == 'cnn': 
+                    input_a = input_a.transpose(0, 1).unsqueeze(1).to(device)
+                    input_b = input_b.transpose(0, 1).unsqueeze(1).to(device)
+                    out_a = model(input_a) 
+                    out_b = model(input_b)                          
             
             out_a = torch.mean(out_a, 0)
             out_b = torch.mean(out_b, 0)
@@ -234,15 +251,36 @@ def main():
         print('total_steps is {}'.format(opt.total_steps))
         
         if opt.seq_training == 'true':
-            model = DeepSpeakerSeqModel.load_model(model_path, 'state_dict')
+            if opt.model_type == 'lstm': 
+                model = DeepSpeakerSeqModel.load_model(model_path, 'state_dict') 
+            elif opt.model_type == 'cnn': 
+                model = DeepSpeakerCnnSeqModel.load_model(model_path, 'state_dict') 
+            else:
+                raise Exception('wrong model_type {}'.format(opt.model_type))            
         else:
-            model = DeepSpeakerModel.load_model(model_path, 'state_dict') 
+            if opt.model_type == 'lstm':  
+                model = DeepSpeakerModel.load_model(model_path, 'state_dict') 
+            elif opt.model_type == 'cnn': 
+                model = DeepSpeakerCnnModel.load_model(model_path, 'state_dict') 
+            else:
+                raise Exception('wrong model_type {}'.format(opt.model_type))
+            
         logging.info('Loading model {}'.format(model_path))
     else:
         if opt.seq_training == 'true':
-            model = DeepSpeakerSeqModel(opt)
+            if opt.model_type == 'lstm': 
+                model = DeepSpeakerSeqModel(opt)
+            elif opt.model_type == 'cnn': 
+                model = DeepSpeakerCnnSeqModel(opt)
+            else:
+                raise Exception('wrong model_type {}'.format(opt.model_type))   
         else:
-            model = DeepSpeakerModel(opt)
+            if opt.model_type == 'lstm':  
+                model = DeepSpeakerModel(opt)
+            elif opt.model_type == 'cnn': 
+                model = DeepSpeakerCnnModel(opt)
+            else:
+                raise Exception('wrong model_type {}'.format(opt.model_type))
     
     print (model)
     for k, v in model.state_dict().items():
