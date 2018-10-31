@@ -1,5 +1,4 @@
 # speaker
-```fchgbduskiygvchb```
 
 ## Tongdun speaker verification  competition : 'nlpr_fight' team work 
 
