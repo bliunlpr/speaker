@@ -1,4 +1,4 @@
-# speaker
+# Deep Segment Attentive Embedding for Speaker Verification
 
 ## Tongdun speaker verification  competition : 'nlpr_fight' team work 
 
