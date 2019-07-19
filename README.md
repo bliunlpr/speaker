@@ -27,7 +27,7 @@ done
 You need build train and dev directory. Each has ```feats.scp``` and ```utt2spk```.  Each line of ```feats.scp``` is "utt_id feats_path" and each line of ```utt2spk``` is "utt_id spk_id". The dev directory also need ```pair.txt```. Each line of ```pair.txt``` is "utt_id0 utt_id1 feats_path0 feats_path1 label". You can run ```python3 local/make_pairs.py dev 1500 1500``` to randomly build the ```pair.txt```.
 
 ## (1) Train model
-We provide two training mehods. One is based on "Generalized End-to-End Loss for Speaker Verfication"[GE2E](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=8462665). Anonther is our proposed Deep Segment Attentive Embedding mehod[DSAE]. The model is LSTM or CNN. We also provide different attention strategies. 
+We provide two training methods. One is based on "Generalized End-to-End Loss for Speaker Verfication"[GE2E](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=8462665). Anonther is our proposed Deep Segment Attentive Embedding mehod[DSAE]. The model is LSTM or CNN. We also provide different attention strategies. 
 ### for GE2E
 ```
 sh run.sh --stage 2 --seq_training false --model_type lstm --train_type  base_attention | last_state | base_attention ```   
@@ -36,6 +36,6 @@ sh run.sh --stage 2 --seq_training false --model_type cnn
 ```
 ### for DSAE
 ```                                                                                                                           
-sh run.sh --stage 2 --seq_training true --model_type lstm | cnn  --train_type base_attention | last_state | base_attention 
+sh run.sh --stage 2 --seq_training true --model_type lstm | cnn  --train_type base_attention | last_state | multi_attention 
 --segment_type  none | all | average
 ``` 
